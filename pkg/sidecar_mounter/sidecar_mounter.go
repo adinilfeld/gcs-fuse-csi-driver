@@ -44,6 +44,9 @@ import (
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/metrics"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/util"
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/expfmt"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/option"
 	"google.golang.org/api/sts/v1"
@@ -54,6 +57,23 @@ import (
 )
 
 const metricEndpointFmt = "http://localhost:%v/metrics"
+
+var (
+	// gcsfuseErrors tracks unexpected GCSFuse crashes and exits.
+	gcsfuseErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gcsfuse_errors",
+			Help: "The cumulative number of GCSFuse errors and crashes.",
+		},
+		[]string{
+			"error_source_location",
+			"error_reason",
+			"volume_name",
+			"bucket_name",
+			"pod_uid",
+		},
+	)
+)
 
 // Mounter will be used in the sidecar container to invoke gcsfuse.
 type Mounter struct {
@@ -194,6 +214,24 @@ func (m *Mounter) Mount(ctx context.Context, mc *MountConfig) error {
 		syscall.Close(mc.FileDescriptor)
 		if err := cmd.Wait(); err != nil {
 			errMsg := fmt.Sprintf("gcsfuse exited with error: %v\n", err)
+
+			// Determine the error reason for the metric
+			reason := "unknown"
+			if exitError, ok := err.(*exec.ExitError); ok {
+				reason = fmt.Sprintf("exit_status_%d", exitError.ExitCode())
+			} else if strings.Contains(err.Error(), "killed") {
+				reason = "signal_killed"
+			}
+
+			// Increment the gcsfuse_errors counter
+			gcsfuseErrors.With(prometheus.Labels{
+				"error_source_location": "sidecar-mounter",
+				"error_reason":          reason,
+				"volume_name":           mc.VolumeName,
+				"bucket_name":           mc.BucketName,
+				"pod_uid":               mc.PodUID,
+			}).Inc()
+
 			if strings.Contains(errMsg, "signal: terminated") {
 				klog.Infof("[%v] gcsfuse was terminated.", mc.VolumeName)
 			} else if strings.Contains(errMsg, "signal: killed") {
@@ -335,8 +373,24 @@ func collectMetrics(ctx context.Context, port, tempDir string) {
 		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
+		// 1. Scrape metrics from gcsfuse process (if alive)
 		if err := scrapeMetrics(timeoutCtx, metricEndpoint, w); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			klog.Errorf("failed to scrape gcsfuse metrics: %v", err)
+			// We do not return an HTTP error here, so that even if gcsfuse has crashed,
+			// the metrics collector can still successfully scrape the mounter's own gcsfuse_errors metric!
+		}
+
+		// 2. Append local mounter metrics (like gcsfuse_errors) to the stream
+		mfs, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			klog.Errorf("failed to gather local metrics: %v", err)
+			return
+		}
+		enc := expfmt.NewEncoder(w, expfmt.FmtText)
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				klog.Errorf("failed to encode local metric %q: %v", mf.GetName(), err)
+			}
 		}
 	})
 
